@@ -4761,69 +4761,117 @@ async def text_handler(event):
                 del user_states[uid]
                 return
             
-            await event.respond(f"<b>🔄 Processing {len(group_links)} groups...</b>\n\nJoining with all your accounts...", parse_mode='html')
-            
-            # Get all user's logged-in accounts
+            # Progress message (animation)
             user_accounts = list(accounts_col.find({"owner_id": uid}))
             if not user_accounts:
-                await event.respond("❌ You have no logged-in accounts.")
+                await event.respond("❌ Add an account first.")
                 del user_states[uid]
                 return
             
-            total_joined = 0
-            total_failed = 0
+            total_ops = len(user_accounts) * len(group_links)
+            done = 0
+            joined = 0
+            failed = 0
             
-            # Join groups with each account
+            progress_msg = await event.respond(
+                f"<b>🔄 Joining Groups...</b>\n\n"
+                f"<b>Accounts:</b> {len(user_accounts)}\n"
+                f"<b>Groups:</b> {len(group_links)}\n\n"
+                f"<b>Progress:</b> <code>0/{total_ops}</code>",
+                parse_mode='html'
+            )
+            
+            # Shared counters with lock
+            lock = asyncio.Lock()
+            stop_progress = False
+            
             from telethon.sessions import StringSession
             from telethon import TelegramClient
             from telethon.tl.functions.channels import JoinChannelRequest
             
-            for acc in user_accounts:
-                # Accounts in DB may use _id (ObjectId). Use safe fallback.
+            async def update_progress_loop():
+                last = -1
+                while not stop_progress:
+                    await asyncio.sleep(1)
+                    async with lock:
+                        cur = done
+                        j = joined
+                        f = failed
+                    if cur != last:
+                        last = cur
+                        try:
+                            await main_bot.edit_message(
+                                progress_msg.chat_id,
+                                progress_msg.id,
+                                f"<b>🔄 Joining Groups...</b>\n\n"
+                                f"<b>Accounts:</b> {len(user_accounts)}\n"
+                                f"<b>Groups:</b> {len(group_links)}\n\n"
+                                f"<b>Progress:</b> <code>{cur}/{total_ops}</code>\n"
+                                f"<b>Joined:</b> <code>{j}</code>\n"
+                                f"<b>Failed:</b> <code>{f}</code>",
+                                parse_mode='html'
+                            )
+                        except Exception:
+                            pass
+            
+            async def join_with_account(acc):
+                nonlocal done, joined, failed
                 account_id = acc.get('account_id') or str(acc.get('_id'))
                 if not account_id:
-                    continue
+                    return
                 
-                # Build a temporary client from stored session
                 try:
                     session_enc = acc.get('session')
                     if not session_enc:
-                        continue
+                        return
                     session = cipher_suite.decrypt(session_enc.encode()).decode()
                 except Exception as e:
-                    print(f"[{account_id}] Failed to decrypt session: {e}")
-                    continue
+                    return
                 
                 client = TelegramClient(StringSession(session), CONFIG['api_id'], CONFIG['api_hash'])
                 try:
                     await client.connect()
                     if not await client.is_user_authorized():
-                        await client.disconnect()
-                        continue
+                        return
                     
                     for username in group_links:
                         try:
                             entity = await client.get_entity(username)
                             await client(JoinChannelRequest(entity))
-                            total_joined += 1
-                            print(f"[{account_id}] Joined: {username}")
-                            await asyncio.sleep(2)  # Delay between joins
-                        except Exception as e:
-                            total_failed += 1
-                            print(f"[{account_id}] Failed to join {username}: {e}")
+                            async with lock:
+                                joined += 1
+                                done += 1
+                        except Exception:
+                            async with lock:
+                                failed += 1
+                                done += 1
+                        await asyncio.sleep(1)  # small per-join delay
                 finally:
                     try:
                         await client.disconnect()
                     except Exception:
                         pass
             
-            # Report results
-            await event.respond(
+            # Run accounts in parallel
+            progress_task = asyncio.create_task(update_progress_loop())
+            account_tasks = [asyncio.create_task(join_with_account(acc)) for acc in user_accounts]
+            await asyncio.gather(*account_tasks, return_exceptions=True)
+            stop_progress = True
+            try:
+                await progress_task
+            except Exception:
+                pass
+            
+            # Final message
+            await main_bot.edit_message(
+                progress_msg.chat_id,
+                progress_msg.id,
                 f"<b>✅ Auto Group Join Complete</b>\n\n"
-                f"<b>Groups:</b> {len(group_links)}\n"
                 f"<b>Accounts:</b> {len(user_accounts)}\n"
-                f"<b>Joined:</b> {total_joined}\n"
-                f"<b>Failed:</b> {total_failed}",
+                f"<b>Groups:</b> {len(group_links)}\n\n"
+                f"<b>Total:</b> <code>{total_ops}</code>\n"
+                f"<b>Joined:</b> <code>{joined}</code>\n"
+                f"<b>Failed:</b> <code>{failed}</code>",
                 parse_mode='html'
             )
             
@@ -5032,6 +5080,7 @@ async def text_handler(event):
         await asyncio.sleep(0.7)
         await status_msg.edit("Sending OTP...")
         
+        client = None
         try:
             proxy = get_next_proxy()
             proxy_info = f" via proxy" if proxy else ""
@@ -5064,9 +5113,19 @@ async def text_handler(event):
         except PhoneNumberInvalidError:
             await status_msg.edit("Invalid phone number!")
             del user_states[uid]
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
         except Exception as e:
             await status_msg.edit(f"Failed to send OTP: {str(e)[:100]}")
             del user_states[uid]
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
     
     elif action == 'otp':
         # Accept code in format: code1234 (remove "code" prefix)
