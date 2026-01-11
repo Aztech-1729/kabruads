@@ -3612,15 +3612,16 @@ async def callback(event):
                     
                     print(f"[ADS DEBUG] has_groups={has_groups}")
                     
-                    if has_groups:
-                        accounts_col.update_one({'_id': acc['_id']}, {'$set': {'is_forwarding': True}})
-                        
-                        if acc['_id'] not in forwarding_tasks or forwarding_tasks[acc['_id']].done():
-                            task = asyncio.create_task(run_forwarding_loop(uid, acc['_id']))
-                            forwarding_tasks[acc['_id']] = task
-                            print(f"[ADS] Started forwarding task for account {acc['_id']}")
-                        
-                        started += 1
+                    # Start account even without groups (user will need to add topics/groups after)
+                    accounts_col.update_one({'_id': acc['_id']}, {'$set': {'is_forwarding': True}})
+                    
+                    if acc['_id'] not in forwarding_tasks or forwarding_tasks[acc['_id']].done():
+                        task = asyncio.create_task(run_forwarding_loop(uid, acc['_id']))
+                        forwarding_tasks[acc['_id']] = task
+                        status_msg = " (⚠️ No groups configured!)" if not has_groups else ""
+                        print(f"[ADS] Started forwarding task for account {acc['_id']}{status_msg}")
+                    
+                    started += 1
                 else:
                     print(f"[ADS DEBUG] Account {acc_id} already forwarding, skipped")
             
