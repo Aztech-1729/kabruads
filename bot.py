@@ -5039,12 +5039,12 @@ async def text_handler(event):
                 return
             user_states[uid]['group_delay'] = val
             user_states[uid]['step'] = 'msg_delay'
-            await event.respond("Enter message delay in seconds (10-120):")
+            await event.respond("Enter message delay in seconds (1-120):")
             return
         
         if step == 'msg_delay':
-            if val < 10 or val > 120:
-                await event.respond("Enter a value between 10-120:")
+            if val < 1 or val > 120:
+                await event.respond("Enter a value between 1-120:")
                 return
             user_states[uid]['msg_delay'] = val
             user_states[uid]['step'] = 'round_delay'
