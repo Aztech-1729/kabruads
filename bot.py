@@ -4572,8 +4572,12 @@ async def callback(event):
             if len(otp) == 5:
                 await event.edit(f"Code: `{otp}`\n\nVerifying...")
                 
+                client = None
                 try:
-                    client = user_states[uid]['client']
+                    client = user_states.get(uid, {}).get('client')
+                    if not client:
+                        raise RuntimeError('Session expired. Please request OTP again.')
+                    
                     await client.sign_in(user_states[uid]['phone'], otp, phone_code_hash=user_states[uid]['hash'])
                     
                     me = await client.get_me()
@@ -4591,9 +4595,14 @@ async def callback(event):
                     
                     account_id = str(result.inserted_id)
                     count = await fetch_groups(client, account_id, user_states[uid]['phone'])
-                    await client.disconnect()
                     
-                    del user_states[uid]
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    
+                    if uid in user_states:
+                        del user_states[uid]
                     
                     print(f"[ACCOUNT] Added account for user {uid}, fetched {count} groups")
                     await event.edit(
@@ -4609,9 +4618,13 @@ async def callback(event):
                     await event.edit("Wrong code! Try again:", buttons=otp_keyboard())
                 except Exception as e:
                     await event.edit(f"Error: {str(e)[:100]}")
-                    if 'client' in user_states[uid]:
-                        await user_states[uid]['client'].disconnect()
-                    del user_states[uid]
+                    try:
+                        if client:
+                            await client.disconnect()
+                    except Exception:
+                        pass
+                    if uid in user_states:
+                        del user_states[uid]
             else:
                 await event.edit(f"Code: `{otp}{'_' * (5-len(otp))}`", buttons=otp_keyboard())
             return
@@ -4785,8 +4798,6 @@ async def text_handler(event):
             lock = asyncio.Lock()
             stop_progress = False
             
-            from telethon.sessions import StringSession
-            from telethon import TelegramClient
             from telethon.tl.functions.channels import JoinChannelRequest
             
             async def update_progress_loop():
@@ -5195,13 +5206,25 @@ async def text_handler(event):
         except PhoneCodeExpiredError:
             await event.respond("Code expired! Use /start to retry.")
             if 'client' in state:
-                await state['client'].disconnect()
-            del user_states[uid]
+                try:
+                    client = state.get('client')
+                    if client:
+                        await client.disconnect()
+                except Exception:
+                    pass
+            if uid in user_states:
+                del user_states[uid]
         except Exception as e:
             await event.respond(f"Error: {str(e)[:100]}")
             if 'client' in state:
-                await state['client'].disconnect()
-            del user_states[uid]
+                try:
+                    client_to_disconnect = state.get('client')
+                    if client_to_disconnect:
+                        await client_to_disconnect.disconnect()
+                except Exception:
+                    pass
+            if uid in user_states:
+                del user_states[uid]
     
     elif action == '2fa':
         try:
@@ -5254,8 +5277,14 @@ async def text_handler(event):
         except Exception as e:
             await event.respond(f"Error: {str(e)[:100]}")
             if 'client' in state:
-                await state['client'].disconnect()
-            del user_states[uid]
+                try:
+                    client = state.get('client')
+                    if client:
+                        await client.disconnect()
+                except Exception:
+                    pass
+            if uid in user_states:
+                del user_states[uid]
     
     elif action == 'add_links':
         account_id = state['account_id']
