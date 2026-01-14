@@ -8,8 +8,8 @@ BOT_CONFIG = {
     'access_password': os.getenv('ACCESS_PASSWORD', 'ADSREACHOP'),
     'mongo_uri': os.getenv('MONGO_URI', 'mongodb+srv://aztech:ayazahmed1122@cluster0.mhuaw3q.mongodb.net/kabruads_db?retryWrites=true&w=majority'),
     'db_name': os.getenv('MONGO_DB_NAME', 'kabruads_db'),
-    'logger_bot_token': os.getenv('LOGGER_BOT_TOKEN', '8392058083:AAFHXooljI8VhzsKctouHHFyHMmxYmPpCG8'),
-    'logger_bot_username': os.getenv('LOGGER_BOT_USERNAME', 'aztechloggersbot'),
+    'logger_bot_token': os.getenv('LOGGER_BOT_TOKEN', '8597566222:AAHkk_sHkcqVx5DVFEhYgeh2QyL8-Jmlg4Q'),
+    'logger_bot_username': os.getenv('LOGGER_BOT_USERNAME', 'Kabrulogsbot'),
 }
 
 # ===================== PLAN TIERS =====================
