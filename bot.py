@@ -790,19 +790,69 @@ async def run_forwarding_loop(user_id, account_id):
                 msg_delay = tier_settings.get('msg_delay', 45)
                 round_delay = tier_settings.get('round_delay', 7200)
                 
+                # ===================== Ads Source (Ads Mode) =====================
+                ads_mode = user.get('ads_mode', 'saved')
+
                 ads = []
-                async for msg in client.iter_messages('me', limit=10):
-                    if msg.text or msg.media:
-                        ads.append(msg)
-                ads.reverse()
-                
-                if not ads:
-                    print(f"[FORWARDING] No ads in Saved Messages for {account_id}")
-                    await add_user_log(user_id, "No ads in Saved Messages - add messages to Saved Messages")
-                    await asyncio.sleep(60)
-                    continue
-                
-                print(f"[FORWARDING] Loaded {len(ads)} ads from Saved Messages")
+                custom_text = None
+                post_source_entity = None
+                post_source_msg_id = None
+                post_source_input_peer = None
+
+                if ads_mode == 'custom':
+                    custom_text = (user.get('ads_custom_message') or '').strip()
+                    if not custom_text:
+                        print(f"[FORWARDING] Custom message not set for {account_id}")
+                        await add_user_log(user_id, "Custom message not set - Settings → Ads Mode → Set Custom Message")
+                        await asyncio.sleep(60)
+                        continue
+                    ads = [None]
+                    print(f"[FORWARDING] Using Custom Message mode")
+
+                elif ads_mode == 'post':
+                    link = (user.get('ads_post_link') or '').strip()
+                    if not link:
+                        print(f"[FORWARDING] Post link not set for {account_id}")
+                        await add_user_log(user_id, "Post link not set - Settings → Ads Mode → Set Post Link")
+                        await asyncio.sleep(60)
+                        continue
+
+                    try:
+                        tail = link.replace('https://t.me/', '')
+                        parts = [p for p in tail.split('/') if p]
+                        if parts and parts[0] == 'c' and len(parts) >= 3:
+                            cid = parts[1]
+                            post_source_entity = int('-100' + str(cid))
+                            post_source_msg_id = int(parts[2])
+                        else:
+                            post_source_entity = parts[0]
+                            post_source_msg_id = int(parts[-1])
+
+                        _m = await client.get_messages(post_source_entity, ids=post_source_msg_id)
+                        if not _m:
+                            raise Exception('Message not found / no access')
+                        post_source_input_peer = await client.get_input_entity(post_source_entity)
+                        ads = [None]
+                        print(f"[FORWARDING] Using Post Link mode")
+                    except Exception as e:
+                        print(f"[FORWARDING] Invalid post link: {e}")
+                        await add_user_log(user_id, f"Invalid post link or no access: {str(e)[:120]}")
+                        await asyncio.sleep(60)
+                        continue
+
+                else:
+                    async for msg in client.iter_messages('me', limit=10):
+                        if msg.text or msg.media:
+                            ads.append(msg)
+                    ads.reverse()
+
+                    if not ads:
+                        print(f"[FORWARDING] No ads in Saved Messages for {account_id}")
+                        await add_user_log(user_id, "No ads in Saved Messages - add messages to Saved Messages")
+                        await asyncio.sleep(60)
+                        continue
+
+                    print(f"[FORWARDING] Loaded {len(ads)} ads from Saved Messages")
                 
                 groups_to_forward = []
                 
@@ -873,7 +923,7 @@ async def run_forwarding_loop(user_id, account_id):
                         print(f"[FORWARDING] Skipped {group['title']} (flood wait: {wait_remaining // 60}m)")
                         continue
                     
-                    msg = ads[i % len(ads)]
+                    msg = ads[i % len(ads)] if ads_mode == 'saved' else None
                     
                     try:
                         sent_msg_id = None
@@ -900,17 +950,33 @@ async def run_forwarding_loop(user_id, account_id):
                             
                             group_name = getattr(current_entity, 'title', group['title'])[:30]
                             
-                            if current_topic_id:
-                                sent_msg_id = await forward_message(client, current_entity, msg.id, msg.peer_id, current_topic_id)
-                            else:
-                                result = await client.forward_messages(current_entity, msg.id, 'me')
-                                if result:
+                            if ads_mode == 'custom':
+                                if current_topic_id:
+                                    r = await client.send_message(current_entity, custom_text, reply_to=current_topic_id)
+                                else:
+                                    r = await client.send_message(current_entity, custom_text)
+                                sent_msg_id = getattr(r, 'id', None)
+
+                            elif ads_mode == 'post':
+                                if current_topic_id:
+                                    sent_msg_id = await forward_message(client, current_entity, post_source_msg_id, post_source_input_peer, current_topic_id)
+                                else:
+                                    result = await client.forward_messages(current_entity, post_source_msg_id, post_source_entity)
+                                    if result:
                                         if isinstance(result, list):
                                             sent_msg_id = result[0].id if len(result) > 0 else None
-
                                         else:
+                                            sent_msg_id = result.id
 
-
+                            else:
+                                if current_topic_id:
+                                    sent_msg_id = await forward_message(client, current_entity, msg.id, msg.peer_id, current_topic_id)
+                                else:
+                                    result = await client.forward_messages(current_entity, msg.id, 'me')
+                                    if result:
+                                        if isinstance(result, list):
+                                            sent_msg_id = result[0].id if len(result) > 0 else None
+                                        else:
                                             sent_msg_id = result.id
                         else:
                             current_entity = None
@@ -939,15 +1005,26 @@ async def run_forwarding_loop(user_id, account_id):
                                 raise Exception(f"Cannot resolve entity for group {group_id}")
                             
                             group_name = group['title'][:30]
-                            result = await client.forward_messages(current_entity, msg.id, 'me')
-                            if result:
+
+                            if ads_mode == 'custom':
+                                r = await client.send_message(current_entity, custom_text)
+                                sent_msg_id = getattr(r, 'id', None)
+
+                            elif ads_mode == 'post':
+                                result = await client.forward_messages(current_entity, post_source_msg_id, post_source_entity)
                                 if result:
                                     if isinstance(result, list):
                                         sent_msg_id = result[0].id if len(result) > 0 else None
                                     else:
                                         sent_msg_id = result.id
 
-                                    sent_msg_id = result.id
+                            else:
+                                result = await client.forward_messages(current_entity, msg.id, 'me')
+                                if result:
+                                    if isinstance(result, list):
+                                        sent_msg_id = result[0].id if len(result) > 0 else None
+                                    else:
+                                        sent_msg_id = result.id
                         
                         sent += 1
                         print(f"[FORWARDING] Sent to {group_name} ({i+1}/{len(groups_to_forward)})")
@@ -973,6 +1050,14 @@ async def run_forwarding_loop(user_id, account_id):
                         failed += 1
                         mark_group_failed(account_id, group_key, str(e))
                         print(f"[FORWARDING] Permanent fail {group['title']}: {type(e).__name__}")
+
+                        # Auto-leave the group if sending fails
+                        try:
+                            if current_entity is not None:
+                                await client.leave_chat(current_entity)
+                                await add_user_log(user_id, f"Auto-left {group['title'][:20]} after failure")
+                        except Exception as le:
+                            print(f"[FORWARDING] Leave failed: {str(le)[:80]}")
                         
                     except Exception as e:
                         failed += 1
@@ -983,6 +1068,15 @@ async def run_forwarding_loop(user_id, account_id):
                             set_flood_wait(account_id, group_key, group['title'], wait_time)
                         else:
                             print(f"[FORWARDING] Error {group['title']}: {error_str[:50]}")
+
+                            # Auto-leave on any non-flood send failure
+                            try:
+                                if current_entity is not None:
+                                    await client.leave_chat(current_entity)
+                                    await add_user_log(user_id, f"Auto-left {group['title'][:20]} after failure")
+                            except Exception as le:
+                                print(f"[FORWARDING] Leave failed: {str(le)[:80]}")
+
                         # Update stats in correct collection
                         update_account_stats(str(account_id), failed=1)
                     
@@ -1314,6 +1408,7 @@ def settings_menu_keyboard(uid):
         [Button.inline("\U0001F4AC Auto Reply", b"menu_autoreply")],  # 💬
         [Button.inline("\U0001F4C2 Topics", b"menu_topics")],        # 📂
         [Button.inline("\U0001F4DD Logs", b"menu_logs")],            # 📝
+        [Button.inline("\U0001F4E3 Ads Mode", b"menu_ads_mode")],     # 📣
     ]
     
     # Premium-only features
@@ -3318,6 +3413,98 @@ async def callback(event):
                     [Button.inline("Back", b"enter_dashboard")]
                 ]
             )
+            return
+
+        # ===================== Ads Mode (Saved/Custom/Post Link) =====================
+        if data == "menu_ads_mode":
+            user_doc = get_user(uid)
+            mode = user_doc.get('ads_mode', 'saved')
+            modes = {
+                'saved': 'Saved Message',
+                'custom': 'Custom Message',
+                'post': 'Post Link'
+            }
+            text = (
+                "<b>📣 Ads Mode</b>\n\n"
+                "<blockquote>Select which message will be used while running ads.</blockquote>\n\n"
+                f"<b>Current:</b> <code>{modes.get(mode, mode)}</code>"
+            )
+            buttons = [
+                [Button.inline("Saved Message" + (" ✅" if mode == 'saved' else ""), b"ads_mode_saved")],
+                [Button.inline("Set Custom Message" + (" ✅" if mode == 'custom' else ""), b"ads_mode_custom")],
+                [Button.inline("Set Post Link" + (" ✅" if mode == 'post' else ""), b"ads_mode_post")],
+                [Button.inline("← Back", b"menu_settings")]
+            ]
+            await event.edit(text, parse_mode='html', buttons=buttons)
+            return
+
+        if data == "ads_mode_saved":
+            users_col.update_one({'user_id': uid}, {'$set': {'ads_mode': 'saved'}}, upsert=True)
+            await event.answer("Ads Mode set: Saved Message", alert=True)
+            await event.edit("<b>✅ Ads Mode Updated</b>\n\nNow bot will use each account's <b>Saved Messages</b> for forwarding.", parse_mode='html', buttons=[[Button.inline("← Back", b"menu_ads_mode")]])
+            return
+
+        if data == "ads_mode_custom":
+            users_col.update_one({'user_id': uid}, {'$set': {'ads_mode': 'custom'}}, upsert=True)
+            cur = (get_user(uid).get('ads_custom_message') or '').strip()
+            preview = _h(cur[:500]) if cur else '<i>Not set</i>'
+            text = (
+                "<b>✍️ Custom Message</b>\n\n"
+                "<b>Current Message:</b>\n"
+                f"{preview}\n\n"
+                "Send a new message to update it."
+            )
+            await event.edit(
+                text,
+                parse_mode='html',
+                buttons=[
+                    [Button.inline("Set Message", b"ads_custom_set")],
+                    [Button.inline("View Current", b"ads_custom_view")],
+                    [Button.inline("← Back", b"menu_ads_mode")]
+                ]
+            )
+            return
+
+        if data == "ads_custom_view":
+            cur = (get_user(uid).get('ads_custom_message') or '').strip()
+            preview = _h(cur) if cur else '<i>Not set</i>'
+            await event.edit(f"<b>✍️ Current Custom Message</b>\n\n{preview}", parse_mode='html', buttons=[[Button.inline("← Back", b"ads_mode_custom")]])
+            return
+
+        if data == "ads_custom_set":
+            user_states[uid] = {'action': 'set_ads_custom_message'}
+            await event.edit("<b>✍️ Send your custom message now</b>\n\n<i>Next message you send will be saved and used for ads.</i>", parse_mode='html', buttons=[[Button.inline("← Cancel", b"menu_ads_mode")]])
+            return
+
+        if data == "ads_mode_post":
+            users_col.update_one({'user_id': uid}, {'$set': {'ads_mode': 'post'}}, upsert=True)
+            cur = (get_user(uid).get('ads_post_link') or '').strip()
+            preview = _h(cur) if cur else '<i>Not set</i>'
+            await event.edit(
+                "<b>🔗 Post Link</b>\n\n"
+                f"<b>Current Link:</b> {preview}\n\n"
+                "Send a Telegram post link like:\n"
+                "<code>https://t.me/username/123</code>\n"
+                "or\n"
+                "<code>https://t.me/c/123456/789</code>",
+                parse_mode='html',
+                buttons=[
+                    [Button.inline("Set Link", b"ads_post_set")],
+                    [Button.inline("View Current", b"ads_post_view")],
+                    [Button.inline("← Back", b"menu_ads_mode")]
+                ]
+            )
+            return
+
+        if data == "ads_post_view":
+            cur = (get_user(uid).get('ads_post_link') or '').strip()
+            preview = _h(cur) if cur else '<i>Not set</i>'
+            await event.edit(f"<b>🔗 Current Post Link</b>\n\n{preview}", parse_mode='html', buttons=[[Button.inline("← Back", b"ads_mode_post")]])
+            return
+
+        if data == "ads_post_set":
+            user_states[uid] = {'action': 'set_ads_post_link'}
+            await event.edit("<b>🔗 Send post link now</b>\n\n<i>Next message you send should be a Telegram post link.</i>", parse_mode='html', buttons=[[Button.inline("← Cancel", b"menu_ads_mode")]])
             return
         
         # ===================== Smart Rotation (Premium) =====================
@@ -5384,6 +5571,57 @@ async def text_handler(event):
         del user_states[uid]
         await event.respond("Auto-reply updated!")
 
+    elif action == 'set_ads_custom_message':
+        # Save custom ads message globally for this user (used by all accounts)
+        msg_text = (event.raw_text or event.text or '').strip()
+        if not msg_text and getattr(event.message, 'message', None):
+            msg_text = str(event.message.message).strip()
+        if not msg_text:
+            await event.respond("❌ Please send a text message.")
+            return
+
+        users_col.update_one({'user_id': uid}, {'$set': {'ads_custom_message': msg_text, 'ads_mode': 'custom'}}, upsert=True)
+        del user_states[uid]
+        await event.respond("✅ Custom message saved! It will be used for ads from all added accounts.")
+
+    elif action == 'set_ads_post_link':
+        link = (event.raw_text or event.text or '').strip()
+        if link.startswith('@'):
+            link = f"https://t.me/{link[1:]}"
+        elif link.startswith('t.me/'):
+            link = f"https://{link}"
+        elif link.startswith('http://t.me/'):
+            link = 'https://' + link[len('http://'):]
+
+        # Accept: https://t.me/username/123 OR https://t.me/c/123456/789 OR topic links with 3 numeric segments
+        ok = False
+        if link.startswith('https://t.me/'):
+            tail = link.replace('https://t.me/', '')
+            parts = [p for p in tail.split('/') if p]
+            # username/msg or c/chat/msg or username/topic/msg
+            if len(parts) in (2, 3):
+                if parts[0] == 'c' and len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                    ok = True
+                elif parts[0] != 'c' and parts[1].isdigit():
+                    # username/123 or username/topic/123
+                    if len(parts) == 2:
+                        ok = True
+                    elif len(parts) == 3 and parts[2].isdigit():
+                        ok = True
+
+        if not ok:
+            await event.respond(
+                "❌ Invalid link! Send a Telegram post link like:\n"
+                "https://t.me/username/123\n"
+                "or\n"
+                "https://t.me/c/123456/789"
+            )
+            return
+
+        users_col.update_one({'user_id': uid}, {'$set': {'ads_post_link': link, 'ads_mode': 'post'}}, upsert=True)
+        del user_states[uid]
+        await event.respond("✅ Post link saved! Now ads will forward this post from all accounts.")
+
 @logger_bot.on(events.NewMessage(pattern=r'^/start(?:@[\w_]+)?\s*(.*)$'))
 async def logger_start(event):
     uid = event.sender_id
@@ -5477,18 +5715,76 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                 
                 await client.start()
                 
+                # ===================== Ads Source (Ads Mode) =====================
+                user_doc = get_user(user_id)
+                ads_mode = user_doc.get('ads_mode', 'saved')
+
                 ads = []
-                async for msg in client.iter_messages('me', limit=10):
-                    if msg.text or msg.media:
-                        ads.append(msg)
-                ads.reverse()
-                
-                if not ads:
-                    print(f"[{account_id}] No ads in Saved Messages")
-                    await send_log(account_id, "No ads found in Saved Messages!")
-                    await client.disconnect()
-                    await asyncio.sleep(60)
-                    continue
+                custom_text = None
+                post_source_entity = None
+                post_source_msg_id = None
+                post_source_input_peer = None
+
+                if ads_mode == 'custom':
+                    custom_text = (user_doc.get('ads_custom_message') or '').strip()
+                    if not custom_text:
+                        print(f"[{account_id}] Custom message not set")
+                        await send_log(account_id, "Custom message not set! Open Settings → Ads Mode → Set Custom Message.")
+                        await client.disconnect()
+                        await asyncio.sleep(60)
+                        continue
+
+                    # placeholder list so rotation logic works
+                    ads = [None]
+
+                elif ads_mode == 'post':
+                    link = (user_doc.get('ads_post_link') or '').strip()
+                    if not link:
+                        print(f"[{account_id}] Post link not set")
+                        await send_log(account_id, "Post link not set! Open Settings → Ads Mode → Set Post Link.")
+                        await client.disconnect()
+                        await asyncio.sleep(60)
+                        continue
+
+                    try:
+                        tail = link.replace('https://t.me/', '')
+                        parts = [p for p in tail.split('/') if p]
+                        if parts and parts[0] == 'c' and len(parts) >= 3:
+                            cid = parts[1]
+                            post_source_entity = int('-100' + str(cid))
+                            post_source_msg_id = int(parts[2])
+                        else:
+                            # username/123 OR username/topic/123
+                            post_source_entity = parts[0]
+                            post_source_msg_id = int(parts[-1])
+
+                        # verify message exists for this account
+                        _m = await client.get_messages(post_source_entity, ids=post_source_msg_id)
+                        if not _m:
+                            raise Exception('Message not found / no access')
+
+                        post_source_input_peer = await client.get_input_entity(post_source_entity)
+                        ads = [None]
+                    except Exception as e:
+                        print(f"[{account_id}] Invalid post link: {e}")
+                        await send_log(account_id, f"Invalid post link or no access: {str(e)[:120]}")
+                        await client.disconnect()
+                        await asyncio.sleep(60)
+                        continue
+
+                else:
+                    # saved (default)
+                    async for msg in client.iter_messages('me', limit=10):
+                        if msg.text or msg.media:
+                            ads.append(msg)
+                    ads.reverse()
+
+                    if not ads:
+                        print(f"[{account_id}] No ads in Saved Messages")
+                        await send_log(account_id, "No ads found in Saved Messages!")
+                        await client.disconnect()
+                        await asyncio.sleep(60)
+                        continue
                 
                 all_targets = []
                 max_topics = tier_settings.get('max_topics', 3)
@@ -5548,7 +5844,7 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                             print(f"[{account_id}] Skipped {group_name} (wait: {mins}m)")
                             continue
                         
-                        msg = ads[i % len(ads)]
+                        msg = ads[i % len(ads)] if ads_mode == 'saved' else None
                         
                         sent_msg_id = None
                         current_topic_id = None
@@ -5565,17 +5861,36 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                             current_entity = await client.get_entity(peer)
                             group_name = getattr(current_entity, 'title', group_name)[:30]
                             
-                            if current_topic_id:
-                                sent_msg_id = await forward_message(client, current_entity, msg.id, msg.peer_id, current_topic_id)
-                            else:
-                                result = await client.forward_messages(current_entity, msg.id, 'me')
-                                if result:
+                            if ads_mode == 'custom':
+                                # Send as text (optionally into a topic)
+                                if current_topic_id:
+                                    r = await client.send_message(current_entity, custom_text, reply_to=current_topic_id)
+                                else:
+                                    r = await client.send_message(current_entity, custom_text)
+                                sent_msg_id = getattr(r, 'id', None)
+
+                            elif ads_mode == 'post':
+                                # Forward a specific post link
+                                if current_topic_id:
+                                    sent_msg_id = await forward_message(client, current_entity, post_source_msg_id, post_source_input_peer, current_topic_id)
+                                else:
+                                    result = await client.forward_messages(current_entity, post_source_msg_id, post_source_entity)
+                                    if result:
                                         if isinstance(result, list):
                                             sent_msg_id = result[0].id if len(result) > 0 else None
-
                                         else:
+                                            sent_msg_id = result.id
 
-
+                            else:
+                                # saved
+                                if current_topic_id:
+                                    sent_msg_id = await forward_message(client, current_entity, msg.id, msg.peer_id, current_topic_id)
+                                else:
+                                    result = await client.forward_messages(current_entity, msg.id, 'me')
+                                    if result:
+                                        if isinstance(result, list):
+                                            sent_msg_id = result[0].id if len(result) > 0 else None
+                                        else:
                                             sent_msg_id = result.id
                         else:
                             data = target['data']
@@ -5605,16 +5920,26 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                                     current_entity = await client.get_entity(group_id)
                                 except:
                                     current_entity = await client.get_entity(int('-100' + str(group_id)))
-                            
-                            result = await client.forward_messages(current_entity, msg.id, 'me')
-                            if result:
+
+                            if ads_mode == 'custom':
+                                r = await client.send_message(current_entity, custom_text)
+                                sent_msg_id = getattr(r, 'id', None)
+
+                            elif ads_mode == 'post':
+                                result = await client.forward_messages(current_entity, post_source_msg_id, post_source_entity)
                                 if result:
                                     if isinstance(result, list):
                                         sent_msg_id = result[0].id if len(result) > 0 else None
                                     else:
                                         sent_msg_id = result.id
 
-                                    sent_msg_id = result.id
+                            else:
+                                result = await client.forward_messages(current_entity, msg.id, 'me')
+                                if result:
+                                    if isinstance(result, list):
+                                        sent_msg_id = result[0].id if len(result) > 0 else None
+                                    else:
+                                        sent_msg_id = result.id
                         
                         sent += 1
                         print(f"[{account_id}] Sent to {group_name} ({i+1}/{len(all_targets)})")
@@ -5645,6 +5970,25 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                         mark_group_failed(account_id, target['key'], str(e))
                         error_type = type(e).__name__
                         print(f"[{account_id}] Failed {group_name}: {error_type}")
+
+                        # Auto-leave the group if sending fails
+                        try:
+                            leave_target = current_entity
+                            if leave_target is None:
+                                if target.get('type') == 'topic':
+                                    d = target.get('data') or {}
+                                    leave_target = d.get('peer')
+                                    if leave_target is None and d.get('url'):
+                                        leave_target, _, _ = parse_link(d.get('url'))
+                                else:
+                                    d = target.get('data') or {}
+                                    leave_target = d.get('username') or d.get('group_id')
+                            if leave_target is not None:
+                                await client.leave_chat(leave_target)
+                                await send_log(account_id, f"Auto-left group after failure: {group_name}")
+                        except Exception as le:
+                            print(f"[{account_id}] Leave failed for {group_name}: {str(le)[:80]}")
+
                         await asyncio.sleep(msg_delay)
                         
                     except Exception as e:
@@ -5661,6 +6005,24 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                         else:
                             failed += 1
                             print(f"[{account_id}] Error {group_name}: {error_str[:50]}")
+
+                        # Auto-leave on any send/forward failure (non-flood)
+                        try:
+                            leave_target = current_entity
+                            if leave_target is None:
+                                if target.get('type') == 'topic':
+                                    d = target.get('data') or {}
+                                    leave_target = d.get('peer')
+                                    if leave_target is None and d.get('url'):
+                                        leave_target, _, _ = parse_link(d.get('url'))
+                                else:
+                                    d = target.get('data') or {}
+                                    leave_target = d.get('username') or d.get('group_id')
+                            if leave_target is not None:
+                                await client.leave_chat(leave_target)
+                                await send_log(account_id, f"Auto-left group after failure: {group_name}")
+                        except Exception as le:
+                            print(f"[{account_id}] Leave failed for {group_name}: {str(le)[:80]}")
                         
                         await asyncio.sleep(msg_delay)
                 
