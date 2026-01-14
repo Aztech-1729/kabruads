@@ -346,6 +346,9 @@ forwarding_tasks = {}
 auto_reply_clients = {}
 last_replied = {}
 
+# Auto group-join cancellation flags (uid -> bool)
+auto_join_cancel = {}
+
 # Payment tracking (gateway.py integration)
 # (Removed) gateway payment tracking (manual UPI now)
 
@@ -727,7 +730,7 @@ def remove_group_from_db(account_id, target_type, group_key, data=None):
             data = data or {}
             link = data.get('url') or data.get('link') or group_key
             # Backwards compatibility: some docs might store as url
-            account_topics_col.delete_many({'account_id': account_id, '$or': [{'link': link}, {'url': link}]})
+            account_topics_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}, '$or': [{'link': link}, {'url': link}]})
             return True
 
         if target_type == 'auto':
@@ -783,12 +786,13 @@ async def send_log(account_id, message, view_link=None, group_name=None):
 
         if view_link and group_name:
             buttons = [[Button.url("View Message", view_link)]]
-            full_msg = f"Sent to **{group_name}**"
-            await logger_bot.send_message(int(chat_id), full_msg, buttons=buttons)
+            # Use HTML consistently in logger channel
+            full_msg = f"<b>Sent to { _h(group_name) }</b>"
+            await logger_bot.send_message(int(chat_id), full_msg, buttons=buttons, parse_mode='html')
         elif message:
             # Handle if message is accidentally a Message object instead of string
             msg_text = str(message) if not isinstance(message, str) else message
-            await logger_bot.send_message(int(chat_id), msg_text)
+            await logger_bot.send_message(int(chat_id), msg_text, parse_mode='html')
     except Exception as e:
         print(f"[LOG ERROR] {e}")
 
@@ -940,6 +944,12 @@ async def run_forwarding_loop(user_id, account_id):
 
                     print(f"[FORWARDING] Loaded {len(ads)} ads from Saved Messages")
                 
+                # Round start log so user can confirm next round started
+                try:
+                    await send_log(account_id, f"Starting round\nMode: {fwd_mode}\nAds mode: {ads_mode}")
+                except Exception:
+                    pass
+
                 groups_to_forward = []
                 
                 acc_id_str = str(account_id)
@@ -947,7 +957,7 @@ async def run_forwarding_loop(user_id, account_id):
                 if fwd_mode in ('topics', 'both'):
                     topic_groups = list(account_topics_col.find({'account_id': acc_id_str}))
                     if not topic_groups:
-                        topic_groups = list(account_topics_col.find({'account_id': account_id}))
+                        topic_groups = list(account_topics_col.find({'account_id': {'$in': _account_id_variants(account_id)}}))
                     
                     for tg in topic_groups:
                         link = tg.get('link') or tg.get('url')
@@ -968,9 +978,9 @@ async def run_forwarding_loop(user_id, account_id):
                     print(f"[FORWARDING] Added {len(groups_to_forward)} topic groups")
                 
                 if fwd_mode in ('auto', 'both'):
-                    auto_groups = list(account_auto_groups_col.find({'account_id': acc_id_str}))
+                    auto_groups = list(account_auto_groups_col.find({'account_id': {'$in': _account_id_variants(account_id)}}))
                     if not auto_groups:
-                        auto_groups = list(account_auto_groups_col.find({'account_id': account_id}))
+                        auto_groups = []
                     
                     count = 0
                     for ag in auto_groups:
@@ -1178,6 +1188,10 @@ async def run_forwarding_loop(user_id, account_id):
                         await asyncio.sleep(group_delay)
                 
                 print(f"[FORWARDING] Round complete. Sent: {sent}, Failed: {failed}, Skipped: {skipped}")
+                try:
+                    await send_log(account_id, f"<b>✅ Round {round_num} complete</b>\n📤 Sent: <code>{sent}</code> | ❌ Failed: <code>{failed}</code> | ⏭ Skipped: <code>{skipped}</code>\n\n⏰ Next: <code>{round_delay}s</code>")
+                except Exception:
+                    pass
                 await add_user_log(user_id, f"Round: {sent} sent, {failed} failed, {skipped} skipped")
                 
                 print(f"[FORWARDING] Waiting {round_delay}s for next round...")
@@ -1260,7 +1274,8 @@ async def fetch_groups(client, account_id, phone):
                         pass
                 
                 groups.append({
-                    'account_id': account_id,
+                    # store account_id consistently as string (ObjectId -> str)
+                    'account_id': str(account_id),
                     'phone': phone,
                     'group_id': group_id,
                     'title': title,
@@ -1270,7 +1285,8 @@ async def fetch_groups(client, account_id, phone):
                     'added_at': datetime.now()
                 })
         if groups:
-            account_auto_groups_col.delete_many({'account_id': account_id})
+            # Remove any older variants (ObjectId vs str)
+            account_auto_groups_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
             account_auto_groups_col.insert_many(groups)
         return len(groups)
     except Exception as e:
@@ -1649,7 +1665,7 @@ def account_menu_keyboard(account_id, acc, user_id):
     tier_settings = get_user_tier_settings(user_id)
     buttons = [
         [Button.inline("Topics", f"topics_{account_id}"), Button.inline("Settings", f"settings_{account_id}")],
-        [Button.inline("Stats", f"stats_{account_id}"), Button.inline("Refresh", f"refresh_{account_id}")],
+        [Button.inline("Stats", f"stats_{account_id}"), Button.inline("Refresh Groups", f"refresh_{account_id}")],
         [Button.inline(btn, data)],
         [Button.inline("Delete", f"delete_{account_id}")]
     ]
@@ -2430,6 +2446,12 @@ async def callback(event):
                 )
             else:
                 await event.answer("Not joined yet. Please join both Channel and Group.", alert=True)
+            return
+        
+        # Stop button for Auto Group Join
+        if data == "auto_join_cancel":
+            auto_join_cancel[uid] = True
+            await event.answer("⏸ Stopping join process...", alert=False)
             return
         
         if data == "accept_privacy":
@@ -4539,7 +4561,7 @@ async def callback(event):
             tier_settings = get_user_tier_settings(uid)
             max_groups = tier_settings.get('max_groups_per_topic', 10)
             
-            links = list(account_topics_col.find({'account_id': account_id, 'topic': topic}))
+            links = list(account_topics_col.find({'account_id': {'$in': _account_id_variants(account_id)}, 'topic': topic}))
             text = f"**{topic.capitalize()}** ({len(links)}/{max_groups} links)\n\n"
             
             for i, l in enumerate(links[:15], 1):
@@ -4558,7 +4580,7 @@ async def callback(event):
         
         if data.startswith("auto_"):
             account_id = data.split("_")[1]
-            groups = list(account_auto_groups_col.find({'account_id': account_id}))
+            groups = list(account_auto_groups_col.find({'account_id': {'$in': _account_id_variants(account_id)}}))
             
             text = f"**Auto Groups** ({len(groups)})\n\n"
             for i, g in enumerate(groups[:15], 1):
@@ -4580,7 +4602,7 @@ async def callback(event):
         if data.startswith("clear_"):
             parts = data.split("_")
             account_id, topic = parts[1], parts[2]
-            result = account_topics_col.delete_many({'account_id': account_id, 'topic': topic})
+            result = account_topics_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}, 'topic': topic})
             await event.answer(f"Deleted {result.deleted_count} links!")
             return
         
@@ -4671,7 +4693,7 @@ async def callback(event):
             account_id = data.split("_")[1]
             acc = get_account_by_id(account_id)
             
-            await event.answer("Refreshing...", alert=False)
+            await event.answer("Refreshing groups...", alert=False)
             
             try:
                 session = cipher_suite.decrypt(acc['session'].encode()).decode()
@@ -4680,8 +4702,10 @@ async def callback(event):
                 
                 if await client.is_user_authorized():
                     count = await fetch_groups(client, account_id, acc['phone'])
+                    await send_log(account_id, f"<b>Groups refreshed:</b> <code>{count}</code>")
                     await client.disconnect()
                     await event.answer(f"Found {count} groups!", alert=True)
+                    await event.edit(f"<b>Refresh Groups</b>\n\n<b>Found:</b> <code>{count}</code>", parse_mode='html', buttons=[[Button.inline("Back", f"acc_{account_id}")]])
                 else:
                     await event.answer("Session expired!", alert=True)
             except Exception as e:
@@ -4788,12 +4812,12 @@ async def callback(event):
             if acc:
                 from bson.objectid import ObjectId
                 accounts_col.delete_one({'_id': ObjectId(account_id)})
-                account_topics_col.delete_many({'account_id': account_id})
-                account_settings_col.delete_many({'account_id': account_id})
-                account_stats_col.delete_many({'account_id': account_id})
-                account_auto_groups_col.delete_many({'account_id': account_id})
-                account_failed_groups_col.delete_many({'account_id': account_id})
-                logger_tokens_col.delete_many({'account_id': account_id})
+                account_topics_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
+                account_settings_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
+                account_stats_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
+                account_auto_groups_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
+                account_failed_groups_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
+                logger_tokens_col.delete_many({'account_id': {'$in': _account_id_variants(account_id)}})
                 
                 if account_id in forwarding_tasks:
                     forwarding_tasks[account_id].cancel()
@@ -5067,22 +5091,27 @@ async def text_handler(event):
             failed = 0
             
             progress_msg = await event.respond(
-                f"<b>🔄 Joining Groups...</b>\n\n"
+                f"<b>Joining Groups...</b>\n\n"
                 f"<b>Accounts:</b> {len(user_accounts)}\n"
                 f"<b>Groups:</b> {len(group_links)}\n\n"
                 f"<b>Progress:</b> <code>0/{total_ops}</code>",
-                parse_mode='html'
+                parse_mode='html',
+                buttons=[[Button.inline("Stop", b"auto_join_cancel"), Button.inline("Back", b"menu_auto_group_join")]]
             )
             
             # Shared counters with lock
             lock = asyncio.Lock()
             stop_progress = False
+            auto_join_cancel[uid] = False
             
             from telethon.tl.functions.channels import JoinChannelRequest
             
             async def update_progress_loop():
                 last = -1
                 while not stop_progress:
+                    if auto_join_cancel.get(uid):
+                        stop_progress = True
+                        break
                     await asyncio.sleep(1)
                     async with lock:
                         cur = done
@@ -5094,7 +5123,7 @@ async def text_handler(event):
                             await main_bot.edit_message(
                                 progress_msg.chat_id,
                                 progress_msg.id,
-                                f"<b>🔄 Joining Groups...</b>\n\n"
+                                f"<b>Joining Groups...</b>\n\n"
                                 f"<b>Accounts:</b> {len(user_accounts)}\n"
                                 f"<b>Groups:</b> {len(group_links)}\n\n"
                                 f"<b>Progress:</b> <code>{cur}/{total_ops}</code>\n"
@@ -5106,6 +5135,8 @@ async def text_handler(event):
                             pass
             
             async def join_with_account(acc):
+                if auto_join_cancel.get(uid):
+                    return
                 nonlocal done, joined, failed
                 account_id = acc.get('account_id') or str(acc.get('_id'))
                 if not account_id:
@@ -5126,6 +5157,8 @@ async def text_handler(event):
                         return
                     
                     for username in group_links:
+                        if auto_join_cancel.get(uid):
+                            break
                         try:
                             entity = await client.get_entity(username)
                             await client(JoinChannelRequest(entity))
@@ -5148,16 +5181,18 @@ async def text_handler(event):
             account_tasks = [asyncio.create_task(join_with_account(acc)) for acc in user_accounts]
             await asyncio.gather(*account_tasks, return_exceptions=True)
             stop_progress = True
+            auto_join_cancel[uid] = False
             try:
                 await progress_task
             except Exception:
                 pass
             
             # Final message
+            final_status = "✅ Complete" if not auto_join_cancel.get(uid) else "⏸ Stopped"
             await main_bot.edit_message(
                 progress_msg.chat_id,
                 progress_msg.id,
-                f"<b>✅ Auto Group Join Complete</b>\n\n"
+                f"<b>{final_status}</b>\n\n"
                 f"<b>Accounts:</b> {len(user_accounts)}\n"
                 f"<b>Groups:</b> {len(group_links)}\n\n"
                 f"<b>Total:</b> <code>{total_ops}</code>\n"
@@ -5261,7 +5296,7 @@ async def text_handler(event):
             display_title = f"{group_username}/{topic_msg_id}" if topic_msg_id else group_username
             
             account_topics_col.insert_one({
-                'account_id': acc_id,
+                'account_id': str(acc_id),  # ensure string for consistency
                 'topic': topic,
                 'link': link,
                 'title': display_title,
@@ -5582,7 +5617,7 @@ async def text_handler(event):
             try:
                 peer, url, topic_id = parse_link(link)
                 account_topics_col.insert_one({
-                    'account_id': account_id,
+                    'account_id': str(account_id),  # ensure string for consistency
                     'topic': topic,
                     'url': url,
                     'peer': peer,
@@ -5778,7 +5813,7 @@ async def forwarder_loop(account_id, selected_topic, user_id):
     
     tier_settings = get_user_tier_settings(user_id)
     
-    await send_log(account_id, f"Forwarding started\nAccount: {acc['phone']}\nTopic: {selected_topic}")
+    await send_log(account_id, f"<b>🚀 Forwarding started</b>\nAccount: <code>{_h(acc['phone'])}</code>\nTopic: <code>{_h(str(selected_topic))}</code>")
     
     while True:
         try:
@@ -5882,14 +5917,14 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                 max_topics = tier_settings.get('max_topics', 3)
                 
                 if selected_topic != "all" and selected_topic in TOPICS[:max_topics]:
-                    topic_links = list(account_topics_col.find({'account_id': account_id, 'topic': selected_topic}))
+                    topic_links = list(account_topics_col.find({'account_id': {'$in': _account_id_variants(account_id)}, 'topic': selected_topic}))
                     for t in topic_links:
                         group_key = t['url']
                         group_name = t.get('url', 'Unknown')
                         if not is_group_failed(account_id, group_key):
                             all_targets.append({'type': 'topic', 'data': t, 'key': group_key, 'name': group_name})
                 
-                auto_groups = list(account_auto_groups_col.find({'account_id': account_id}))
+                auto_groups = list(account_auto_groups_col.find({'account_id': {'$in': _account_id_variants(account_id)}}))
                 topic_peers = set()
                 
                 if selected_topic != "all":
@@ -5905,7 +5940,7 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                 
                 active_waits = get_active_flood_waits(account_id)
                 print(f"[{account_id}] Forwarding to {len(all_targets)} groups (flood waits: {active_waits})")
-                await send_log(account_id, f"Starting round\nGroups: {len(all_targets)}\nFlood waits: {active_waits}")
+                await send_log(account_id, f"<b>🔄 Starting round</b>\nGroups: <code>{len(all_targets)}</code>\nFlood waits: <code>{active_waits}</code>")
                 
                 # ===================== Smart Rotation (Premium) =====================
                 # Shuffle target order if enabled
@@ -6136,7 +6171,7 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                 
                 update_account_stats(account_id, sent=sent, failed=failed)
                 
-                log_msg = f"Round complete!\n\nSent: {sent}\nFailed: {failed}\nSkipped: {skipped}\nNext round: {round_delay}s"
+                log_msg = f"<b>✅ Round complete</b>\n📤 Sent: <code>{sent}</code> | ❌ Failed: <code>{failed}</code> | ⏭ Skipped: <code>{skipped}</code>\n\n⏰ Next: <code>{round_delay}s</code>"
                 await send_log(account_id, log_msg)
                 
                 print(f"[{account_id}] Round done! Sent: {sent}, Failed: {failed}")
@@ -6147,10 +6182,18 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                 
             except Exception as e:
                 print(f"[{account_id}] Loop error: {e}")
+                try:
+                    await send_log(account_id, f"<b>⚠ Loop error</b>\n<code>{_h(str(e)[:150])}</code>\n\nRetrying in 60s...")
+                except:
+                    pass
                 await asyncio.sleep(60)
                 
         except Exception as e:
             print(f"[{account_id}] Outer error: {e}")
+            try:
+                await send_log(account_id, f"<b>⚠ Error</b>\n<code>{_h(str(e)[:150])}</code>\n\nRetrying in 60s...")
+            except:
+                pass
             await asyncio.sleep(60)
     
     if account_id in forwarding_tasks:
