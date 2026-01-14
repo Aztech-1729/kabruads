@@ -29,8 +29,8 @@ from telethon.errors import (
     MessageNotModifiedError,
     UserNotParticipantError
 )
-from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.functions.messages import ForwardMessagesRequest
+from telethon.tl.functions.channels import GetParticipantRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import ForwardMessagesRequest, DeleteChatUserRequest
 from telethon.tl.types import Channel, Chat, User, InputPeerChannel, InputPeerChat
 from cryptography.fernet import Fernet
 from pymongo import MongoClient
@@ -681,6 +681,92 @@ def _account_id_variants(account_id):
     """Return possible stored variants for account_id field (ObjectId vs str)."""
     return [account_id, str(account_id)]
 
+async def safe_leave_chat(client, target):
+    """Best-effort leave for channels/supergroups and basic groups.
+
+    `target` can be an entity, username, chat id, or input peer.
+    """
+    if target is None:
+        return False
+
+    try:
+        entity = target
+        # Resolve to an entity if needed
+        if isinstance(target, (str, int)):
+            entity = await client.get_entity(target)
+
+        # Channels / supergroups
+        if isinstance(entity, Channel) or isinstance(entity, InputPeerChannel):
+            peer = await client.get_input_entity(entity)
+            await client(LeaveChannelRequest(peer))
+            return True
+
+        # Basic groups
+        if isinstance(entity, Chat) or isinstance(entity, InputPeerChat):
+            chat_id = entity.id if hasattr(entity, 'id') else getattr(entity, 'chat_id', None)
+            await client(DeleteChatUserRequest(chat_id=chat_id, user_id='me'))
+            return True
+
+        # Fallback: try leave as channel
+        peer = await client.get_input_entity(entity)
+        await client(LeaveChannelRequest(peer))
+        return True
+
+    except Exception:
+        return False
+
+
+def remove_group_from_db(account_id, target_type, group_key, data=None):
+    """Remove a group/topic target permanently from DB for this account."""
+    try:
+        # Clear failure/flood tracking too
+        account_failed_groups_col.delete_one({'account_id': account_id, 'group_key': group_key})
+        account_flood_waits_col.delete_one({'account_id': account_id, 'group_key': group_key})
+
+        if target_type == 'topic':
+            data = data or {}
+            link = data.get('url') or data.get('link') or group_key
+            # Backwards compatibility: some docs might store as url
+            account_topics_col.delete_many({'account_id': account_id, '$or': [{'link': link}, {'url': link}]})
+            return True
+
+        if target_type == 'auto':
+            data = data or {}
+            gid = data.get('group_id')
+            if gid is None:
+                try:
+                    gid = int(str(group_key))
+                except Exception:
+                    gid = None
+            q = {'account_id': account_id}
+            if gid is not None:
+                q['group_id'] = gid
+            else:
+                q['group_id'] = {'$exists': True}
+            account_auto_groups_col.delete_many(q)
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
+async def notify_auto_left(account_id, phone, group_name, group_key, reason=None):
+    """Send logger notification when a group is auto-left."""
+    try:
+        reason_txt = f"\nReason: {reason}" if reason else ""
+        msg = (
+            "🚪 <b>Auto Left Group</b>\n"
+            f"Phone: <code>{_h(phone or 'Unknown')}</code>\n"
+            f"Group: <code>{_h(group_name or 'Unknown')}</code>\n"
+            f"Key: <code>{_h(str(group_key))}</code>"
+            f"{reason_txt}"
+        )
+        await send_log(account_id, msg)
+    except Exception:
+        pass
+
+
 async def send_log(account_id, message, view_link=None, group_name=None):
     """Send logs via logger bot with View Message button."""
     try:
@@ -1054,7 +1140,10 @@ async def run_forwarding_loop(user_id, account_id):
                         # Auto-leave the group if sending fails
                         try:
                             if current_entity is not None:
-                                await client.leave_chat(current_entity)
+                                left_ok = await safe_leave_chat(client, current_entity)
+                                if left_ok:
+                                    remove_group_from_db(acc_id_str, group.get('type'), group_key, group)
+                                    await notify_auto_left(account_id, acc.get('phone'), group.get('title'), group_key, reason=type(e).__name__)
                                 await add_user_log(user_id, f"Auto-left {group['title'][:20]} after failure")
                         except Exception as le:
                             print(f"[FORWARDING] Leave failed: {str(le)[:80]}")
@@ -1072,7 +1161,10 @@ async def run_forwarding_loop(user_id, account_id):
                             # Auto-leave on any non-flood send failure
                             try:
                                 if current_entity is not None:
-                                    await client.leave_chat(current_entity)
+                                    left_ok = await safe_leave_chat(client, current_entity)
+                                    if left_ok:
+                                        remove_group_from_db(acc_id_str, group.get('type'), group_key, group)
+                                        await notify_auto_left(account_id, acc.get('phone'), group.get('title'), group_key, reason=error_str[:120])
                                     await add_user_log(user_id, f"Auto-left {group['title'][:20]} after failure")
                             except Exception as le:
                                 print(f"[FORWARDING] Leave failed: {str(le)[:80]}")
@@ -5984,8 +6076,16 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                                     d = target.get('data') or {}
                                     leave_target = d.get('username') or d.get('group_id')
                             if leave_target is not None:
-                                await client.leave_chat(leave_target)
-                                await send_log(account_id, f"Auto-left group after failure: {group_name}")
+                                left_ok = await safe_leave_chat(client, leave_target)
+                                if left_ok:
+                                    remove_group_from_db(account_id, target.get('type'), group_key, target.get('data'))
+                                    try:
+                                        phone = (acc.get('phone') if acc else None)
+                                    except Exception:
+                                        phone = None
+                                    await notify_auto_left(account_id, phone, group_name, group_key, reason=error_type)
+                                else:
+                                    await send_log(account_id, f"Leave attempt failed: {group_name}")
                         except Exception as le:
                             print(f"[{account_id}] Leave failed for {group_name}: {str(le)[:80]}")
 
@@ -6019,8 +6119,16 @@ async def forwarder_loop(account_id, selected_topic, user_id):
                                     d = target.get('data') or {}
                                     leave_target = d.get('username') or d.get('group_id')
                             if leave_target is not None:
-                                await client.leave_chat(leave_target)
-                                await send_log(account_id, f"Auto-left group after failure: {group_name}")
+                                left_ok = await safe_leave_chat(client, leave_target)
+                                if left_ok:
+                                    remove_group_from_db(account_id, target.get('type'), group_key, target.get('data'))
+                                    try:
+                                        phone = (acc.get('phone') if acc else None)
+                                    except Exception:
+                                        phone = None
+                                    await notify_auto_left(account_id, phone, group_name, group_key, reason=error_str[:120])
+                                else:
+                                    await send_log(account_id, f"Leave attempt failed: {group_name}")
                         except Exception as le:
                             print(f"[{account_id}] Leave failed for {group_name}: {str(le)[:80]}")
                         
