@@ -1,8 +1,8 @@
 import os
 
 BOT_CONFIG = {
-    'api_id': int(os.getenv('TELEGRAM_API_ID', '23131964')),
-    'api_hash': os.getenv('TELEGRAM_API_HASH', '1f383b963dd342881edce03bd1e686a5'),
+    'api_id': int(os.getenv('TELEGRAM_API_ID', '33388685')),
+    'api_hash': os.getenv('TELEGRAM_API_HASH', '8a39446c6f69527dbfbb8e0e6c6a146f'),
     'bot_token': os.getenv('BOT_TOKEN', '8458516790:AAGVNZ3prRmEERf4iz8QM9ff__R3Fun33Po'),
     'owner_id': int(os.getenv('OWNER_ID', '6670166083')),
     'access_password': os.getenv('ACCESS_PASSWORD', 'ADSREACHOP'),
